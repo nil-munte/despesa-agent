@@ -4,6 +4,8 @@ import os
 import json
 import requests
 import re
+import unicodedata
+from difflib import get_close_matches
 
 app = FastAPI()
 
@@ -22,32 +24,54 @@ client = OpenAI(
 )
 
 # =========================
-# USUARIS
+# USUARIS (CANÒNICS + ALIASES)
 # =========================
 
-USERS = ["nil", "anna"]
+USERS = {
+    "nil": ["nil", "Nil"],
+    "nuria": ["nuria", "núria", "Nuria", "Núria"]
+}
 
 # =========================
-# UX HELPERS
+# NORMALITZACIÓ
+# =========================
+
+def normalize(text: str):
+    text = text.lower().strip()
+
+    # treure accents
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+
+    return text
+
+# =========================
+# DETECCIÓ USUARI
 # =========================
 
 def extract_user(text: str):
-    text_lower = text.lower()
+    text = normalize(text)
 
-    for user in USERS:
-        if user in text_lower:
-            return user
+    for canonical, aliases in USERS.items():
+        for alias in aliases:
+            if alias in text:
+                return canonical
 
-    # fuzzy simple
-    for user in USERS:
-        if user[:3] in text_lower:
-            return user
+    # fuzzy fallback (errors petits)
+    all_users = list(USERS.keys())
+    match = get_close_matches(text, all_users, n=1, cutoff=0.6)
+
+    if match:
+        return match[0]
 
     return None
 
+# =========================
+# INPUT INCOMPLET
+# =========================
 
 def is_incomplete(text: str):
-    has_number = any(char.isdigit() for char in text)
+    has_number = any(c.isdigit() for c in text)
     has_words = len(text.split()) >= 2
     return not (has_number and has_words)
 
@@ -158,12 +182,12 @@ async def telegram_webhook(req: Request):
         if user is None:
             send_message(
                 chat_id,
-                "❌ No reconec l'usuari.\nUsa: nil o anna"
+                "❌ No reconec l'usuari.\nUsa: nil, anna o nuria"
             )
             return {"ok": True}
 
         # =========================
-        # LLM PROCESSING
+        # LLM
         # =========================
         result = llm_extract(text)
 
