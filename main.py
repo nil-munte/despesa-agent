@@ -5,7 +5,6 @@ import json
 import requests
 import re
 import unicodedata
-from difflib import get_close_matches
 
 app = FastAPI()
 
@@ -24,13 +23,10 @@ client = OpenAI(
 )
 
 # =========================
-# USUARIS (CANÒNICS + ALIASES)
+# USUARIS PERMESOS
 # =========================
 
-USERS = {
-    "nil": ["nil", "Nil"],
-    "nuria": ["nuria", "núria", "Nuria", "Núria"]
-}
+VALID_USERS = ["nil", "nuria"]
 
 # =========================
 # NORMALITZACIÓ
@@ -38,42 +34,17 @@ USERS = {
 
 def normalize(text: str):
     text = text.lower().strip()
-
-    # treure accents
     text = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in text if not unicodedata.combining(c))
-
     return text
 
 # =========================
-# DETECCIÓ USUARI
+# VALIDACIÓ USUARI
 # =========================
 
-def extract_user(text: str):
+def contains_valid_user(text: str):
     text = normalize(text)
-
-    for canonical, aliases in USERS.items():
-        for alias in aliases:
-            if alias in text:
-                return canonical
-
-    # fuzzy fallback (errors petits)
-    all_users = list(USERS.keys())
-    match = get_close_matches(text, all_users, n=1, cutoff=0.6)
-
-    if match:
-        return match[0]
-
-    return None
-
-# =========================
-# INPUT INCOMPLET
-# =========================
-
-def is_incomplete(text: str):
-    has_number = any(c.isdigit() for c in text)
-    has_words = len(text.split()) >= 2
-    return not (has_number and has_words)
+    return any(user in text for user in VALID_USERS)
 
 # =========================
 # JSON SAFE PARSE
@@ -89,26 +60,41 @@ def safe_json_parse(text):
         raise ValueError("Invalid JSON")
 
 # =========================
-# VALIDACIÓ
+# VALIDACIÓ ESTRICTA
 # =========================
 
 def validate_data(data):
-    nom = data.get("nom", "desconegut")
-    motiu = data.get("motiu", "sense motiu")
+    if not isinstance(data, dict):
+        raise ValueError("No JSON")
+
+    if "nom" not in data or "cost" not in data or "motiu" not in data:
+        raise ValueError("Falten camps")
+
+    nom = normalize(str(data["nom"]))
+    motiu = str(data["motiu"])
 
     try:
-        cost = float(data.get("cost", 0))
+        cost = float(data["cost"])
     except:
-        cost = 0
+        raise ValueError("Cost invàlid")
+
+    if nom not in VALID_USERS:
+        raise ValueError("Usuari no vàlid")
+
+    if cost <= 0:
+        raise ValueError("Cost invàlid")
+
+    if not motiu.strip():
+        raise ValueError("Motiu buit")
 
     return {
         "nom": nom,
         "cost": cost,
-        "motiu": motiu
+        "motiu": motiu.strip()
     }
 
 # =========================
-# LLM (GROQ)
+# LLM
 # =========================
 
 def llm_extract(text: str):
@@ -118,12 +104,22 @@ def llm_extract(text: str):
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "Ets un extractor de despeses d'una parella. "
-                    "Retorna NOMÉS JSON amb: nom, cost, motiu. "
-                    "No inventis dades. "
-                    "nom ha de ser un usuari conegut."
-                )
+                "content": """
+Extreu dades del text.
+
+Regles:
+- "nom" ha de ser "nil" o "nuria"
+- "cost" és un número
+- "motiu" és el concepte
+
+L'ordre pot ser qualsevol.
+
+No inventis dades.
+Si no és clar, retorna error.
+
+Retorna NOMÉS JSON:
+{"nom": "...", "cost": 0, "motiu": "..."}
+"""
             },
             {
                 "role": "user",
@@ -165,30 +161,20 @@ async def telegram_webhook(req: Request):
         print("📩 Input:", text)
 
         # =========================
-        # UX 1: input incomplet
+        # VALIDACIÓ PRÈVIA
         # =========================
-        if is_incomplete(text):
+
+        if not contains_valid_user(text):
             send_message(
                 chat_id,
-                "🤔 No ho he entès del tot.\nEx: dinar 25 nil"
+                "❌ Usuari no reconegut.\nUsa: nil o nuria"
             )
             return {"ok": True}
 
         # =========================
-        # UX 2: usuari desconegut
+        # LLM + VALIDACIÓ
         # =========================
-        user = extract_user(text)
 
-        if user is None:
-            send_message(
-                chat_id,
-                "❌ No reconec l'usuari.\nUsa: nil, anna o nuria"
-            )
-            return {"ok": True}
-
-        # =========================
-        # LLM
-        # =========================
         result = llm_extract(text)
 
         resposta = (
@@ -202,6 +188,9 @@ async def telegram_webhook(req: Request):
 
     except Exception as e:
         print("❌ Error:", e)
-        send_message(chat_id, "Error processant missatge 😅")
+        send_message(
+            chat_id,
+            "❌ No he pogut interpretar la despesa.\nEx: 'dinar 25 nil'"
+        )
 
     return {"ok": True}
